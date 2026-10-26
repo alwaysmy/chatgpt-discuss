@@ -47,9 +47,13 @@ function Get-LastAnswerText {
   catch { return $null }
 }
 function Test-GenActive {
-  # 页面是否仍在生成：定位"停止"按钮（生成中才存在）。返回 $true/$false；探测失败返回 $null。
+  # 页面是否仍在生成：定位"停止"按钮（生成中才存在）。返回 $true/$false；信号不可用返回 $null。
   # 2026-10-15 加：作为"整轮落档"的页面侧完成信号——多段交付时，先完成的段不落档的判据。
   # 不押单一选择器：新版无 data-testid 时按 aria-label（停止/stop）兜底，并做可见性检查。
+  # 2026-10-26 真机实测（登录态、新版页面）：`button[data-testid="stop-button"]` 已不存在，
+  # 停止键只有 aria-label="停止"；生成中稳定 $true、结束后 $false（双候选设计成立）。
+  # **契约**：只有 [bool] 才算有效信号；Eval-JS 返回 $null/字符串/多值一律返回 $null。
+  #   "探测失败" ≠ "生成已结束"——把前者当后者会直接落档前缀（静默写残缺）。
   param([string]$S)
   $js = @'
 (()=>{
@@ -60,7 +64,11 @@ function Test-GenActive {
   return !!b;
 })()
 '@
-  try { $v = Eval-JS $js $S; return ("$v" -eq 'true') } catch { return $null }
+  try {
+    $v = Eval-JS $js $S
+    if ($v -is [bool]) { return $v }
+    return $null
+  } catch { return $null }
 }
 function Resolve-ComposerTarget {
   # 定位对话框并打标记 data-cc-composer，返回命中描述（空串 = 没找到）。

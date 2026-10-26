@@ -948,16 +948,28 @@ while ((Get-Date) -lt $deadline) {
   }
   $verdict = Test-NewAnswer -BaseN $baseN -BaseText $baseText -BaseKnown $baseKnown `
                             -N ([int]$st.n) -Text ([string]$st.text)
-  # ── 整轮落档门（2026-10-15 加）────────────────────────────────────────────
+  # ── 整轮落档门（2026-10-15 加，2026-10-15 二次修正）──────────────────────
   # 多段交付的回答里，先完成的段就会让 Test-NewAnswer 判 new；此时页面可能仍在生成
   # 后续段，直接落档会丢后半。页面"停止"按钮是廉价的整轮完成信号（一次本机 DOM 读，
-  # 不耗接口配额）：明确结束 → 落档；仍在生成 → 继续等；信号不可用 → 两读一致才落。
-  # 只在"判 new"时才探测页面，其余轮次不必多读 DOM。
+  # 不耗接口配额）：明确结束 → 落档；仍在生成 → 继续等；**信号不可用 → 继续等**。
+  # 为什么信号不可用时不能拿"文本稳定"当完成证据：这段文本只含已完成段，后续段流式
+  # 期间它天然不变，两读必然相等——那会把多段回答静默截成前缀。等不到信号由超时收尾
+  # 按"不完整"落档并标注。只在"判 new"时才探测页面，其余轮次不必多读 DOM。
   if ($verdict -eq 'new') {
     $genActive = Test-GenActive $Session
     $ready = Test-AnswerReady -Verdict $verdict -GenActive $genActive `
                               -Text ([string]$st.text) -LastText $lastTurnText
-    if ($ready -eq 'accept') { $answer = [string]$st.text; break }
+    if ($ready -eq 'accept') {
+      # 落档前必须重读一次接口（2026-10-15 修）：上面的 $st 是**探测页面之前**的快照，
+      # 从读接口到探测"停止"按钮之间还有一次 evaluate 往返（实测百毫秒~秒级）。最后一段
+      # 若在这个窗口内完成，用旧快照落档就会整段丢掉。重读后正文仍相同才落档；正文变了
+      # 或重读失败都回下一轮重新判断（宁可多等一个轮询间隔，也不落可能缺段的快照）。
+      $recheck = Get-ConversationState -S $Session -ConvId $convId
+      if ($recheck -and -not $recheck.error) {
+        if ([string]$recheck.text -eq [string]$st.text) { $answer = [string]$st.text; break }
+        $st = $recheck
+      }
+    }
     if ($ready -eq 'wait-generating' -and -not $genWaitWarned) {
       $genWaitWarned = $true
       Write-Warning ("新完成的段已出现，但页面仍在生成——按多段交付处理，继续等整轮完成" +
@@ -992,11 +1004,13 @@ if (-not $answer) {
       $verdict = Test-NewAnswer -BaseN $baseN -BaseText $baseText -BaseKnown $baseKnown `
                                 -N ([int]$st.n) -Text ([string]$st.text)
       if ($verdict -eq 'new') {
-        # 超时收尾也过整轮落档门：页面仍在生成 → 按"不完整"落档并标注（不静默写残缺）
-        if ((Test-GenActive $Session) -eq $true) {
+        # 超时收尾也过整轮落档门：页面仍在生成 / 信号不可用 → 按"不完整"落档并标注。
+        # 2026-10-15 修：原先只有 $true 才标注，$null（探测失败）会被当成"生成已结束"
+        # 直接落档且无告警——那正是"静默写残缺"，与 SKILL.md 的底线冲突。
+        if ((Test-GenActive $Session) -ne $false) {
           $answer = [string]$st.text
           $answerFromPartial = $true
-          Write-Warning ("超时收尾：新段已出现但页面仍在生成——按**不完整**落档" +
+          Write-Warning ("超时收尾：新段已出现但未经页面确认生成结束——按**不完整**落档" +
                          "（组合文本 $($st.text.Length) 字符），请用 tools\verify-docs.ps1 复核")
         } else {
           $answer = [string]$st.text

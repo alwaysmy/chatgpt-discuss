@@ -4,11 +4,12 @@
   chatgpt-discuss 的自检（改完脚本跑这个，不依赖 AI 自己判断"改对没改对"）。
 .DESCRIPTION
   三部分：
-    A. 静态检查：对真实脚本跑 lint.ps1（必须 0 ERROR）
+    A. 静态检查：对改动的真实脚本跑 lint.ps1（必须 0 ERROR）
        A2 锚点纯函数表驱动；A3 新答案判定表驱动（含 2026-09-23 静默写错档案的回归）；
        A4 轮询节奏表驱动 + 请求量性质断言（治 429 加压 / 页面加载不出来）；
        A5 部分获取判定表驱动（等够且确有新内容才取回）；
-       A6 整轮落档门表驱动（多段交付：先完成的段不落档，等整轮/两读一致）
+       A6 整轮落档门表驱动（多段交付：先完成的段不落档；**信号不可用不得当完成**）；
+       A7 页面生成信号契约（Eval-JS 返回映射：只有 [bool] 才算有效信号）
     B. 检查器自证：对故意注入坑的样本跑 lint.ps1（必须抓到 ≥6 项）
     C. 离线行为：只测不碰浏览器的路径（用不可达 daemon 逼它提前失败），校验退出码
        T1 -Status 空状态            → 0
@@ -62,8 +63,20 @@ $deadDaemon = @("-Daemon", "http://127.0.0.1:19999")   # 不可达：逼脚本�
 
 Write-Host ""
 Write-Host "=== A. 静默检查（真实脚本） ===" -ForegroundColor Cyan
-& $pwshExe -NoProfile -File $lintPath -Path $scriptPath | Out-Null
-Add-Result "A1 lint 真实脚本 0 ERROR" ($LASTEXITCODE -eq 0) "exit=$LASTEXITCODE"
+# 改了哪个脚本就 lint 哪个：以前只 lint ask-gpt.ps1，库（chatgpt-api/page）与
+# verify-docs 的回归不会被自检抓到，等于 A1 漏了这次改动的 3/4。
+$lintTargets = @(
+  $scriptPath,
+  (Join-Path $SkillDir "scripts\lib\chatgpt-api.ps1"),
+  (Join-Path $SkillDir "scripts\lib\chatgpt-page.ps1"),
+  (Join-Path $SkillDir "tools\verify-docs.ps1")
+)
+$a1bad = @()
+foreach ($t in $lintTargets) {
+  & $pwshExe -NoProfile -File $lintPath -Path $t | Out-Null
+  if ($LASTEXITCODE -ne 0) { $a1bad += (Split-Path $t -Leaf) }
+}
+Add-Result "A1 lint 真实脚本 0 ERROR" ($a1bad.Count -eq 0) $(if ($a1bad.Count) { "失败: " + ($a1bad -join ', ') } else { "$($lintTargets.Count) 个脚本" })
 
 Write-Host ""
 Write-Host "=== A2. 锚点纯函数（库单测，表驱动） ===" -ForegroundColor Cyan
@@ -178,13 +191,16 @@ Add-Result "A5 部分获取判定" ($a5bad.Count -eq 0) $(if ($a5bad.Count) { "�
 Write-Host ""
 Write-Host "=== A6. 整轮落档门（纯函数，表驱动） ===" -ForegroundColor Cyan
 # 2026-10-15 多段交付回归：长回答拆多条消息时，先完成的段就会让"新答案判定"成立；
-# 落档门保证只在"页面生成已结束"（或信号不可用时两读一致）才写入档案，避免只存一段。
+# 落档门保证只在页面"确认生成结束"（$false）时才写入档案，避免只存一段。
+# **信号不可用（$null）绝不能被当成完成**：已完成段在后续段流式期间文本天然不变，
+# "两读一致"证明不了整轮结束（见 A6 第 5、6 条——这是修 K2 的回归用例）。
 $readyCases = @(
   @{ name = 'verdict 非 new 一律不等';       p = @{ Verdict = 'not-yet';         GenActive = $false; Text = 'x';  LastText = $null }; want = 'wait' }
   @{ name = '页面已结束 → 落档';             p = @{ Verdict = 'new';             GenActive = $false; Text = 'x';  LastText = $null }; want = 'accept' }
   @{ name = '页面仍在生成 → 继续等(多段)';   p = @{ Verdict = 'new';             GenActive = $true;  Text = 'x';  LastText = $null }; want = 'wait-generating' }
-  @{ name = '信号不可用 + 首见 → 等稳定';    p = @{ Verdict = 'new';             GenActive = $null;  Text = 'x';  LastText = $null }; want = 'wait-stability' }
-  @{ name = '信号不可用 + 两读一致 → 落档';  p = @{ Verdict = 'new';             GenActive = $null;  Text = 'x';  LastText = 'x'   }; want = 'accept' }
+  @{ name = '信号不可用 + 首见 → 继续等';    p = @{ Verdict = 'new';             GenActive = $null;  Text = 'x';  LastText = $null }; want = 'wait-stability' }
+  @{ name = '回归:信号不可用+两读一致仍等';   p = @{ Verdict = 'new';             GenActive = $null;  Text = 'x';  LastText = 'x'   }; want = 'wait-stability' }
+  @{ name = '回归:非 bool 信号(字符串)仍等';  p = @{ Verdict = 'new';             GenActive = 'true'; Text = 'x';  LastText = 'x'   }; want = 'wait-stability' }
   @{ name = '信号不可用 + 文本仍变 → 等';    p = @{ Verdict = 'new';             GenActive = $null;  Text = 'x2'; LastText = 'x1'  }; want = 'wait-stability' }
   @{ name = 'stale-same-text 不等';          p = @{ Verdict = 'stale-same-text'; GenActive = $false; Text = 'x';  LastText = $null }; want = 'wait' }
   @{ name = 'empty 不等';                    p = @{ Verdict = 'empty';           GenActive = $false; Text = '';   LastText = $null }; want = 'wait' }
@@ -195,7 +211,32 @@ foreach ($c in $readyCases) {
   $got = Test-AnswerReady @pp
   if ($got -ne $c.want) { $a6bad += "$($c.name): 期望 $($c.want) 实得 $got" }
 }
-Add-Result "A6 整轮落档门（多段交付回归）" ($a6bad.Count -eq 0) $(if ($a6bad.Count) { "失败: " + ($a6bad -join '; ') } else { "$($readyCases.Count) 组用例全过" })
+Add-Result "A6 整轮落档门（多段交付 / 无信号不落档回归）" ($a6bad.Count -eq 0) $(if ($a6bad.Count) { "失败: " + ($a6bad -join '; ') } else { "$($readyCases.Count) 组用例全过" })
+
+Write-Host ""
+Write-Host "=== A7. 页面生成信号契约（mock Eval-JS） ===" -ForegroundColor Cyan
+# Test-GenActive 是整轮落档门唯一的页面信号，契约是"只有 [bool] 才算有效信号，其余
+# 一律返回 $null（=信号不可用）"。旧实现把 Eval-JS 的 $null/字符串都当 $false（=生成
+# 已结束），探测失败时会直接落档前缀。这里用 mock 把映射钉死（$null ≠ $false）。
+$pageLib = Join-Path $SkillDir "scripts\lib\chatgpt-page.ps1"
+. $pageLib
+$script:MockEval = { $true }
+function Eval-JS { param([string]$Code, [string]$SessionName) & $script:MockEval }
+$genCases = @(
+  @{ name = '生成中(true)';          mock = { $true };        want = $true }
+  @{ name = '已结束(false)';         mock = { $false };       want = $false }
+  @{ name = '返回 null';             mock = { $null };        want = $null }
+  @{ name = '返回字符串 "true"';     mock = { 'true' };       want = $null }
+  @{ name = 'Eval-JS 抛异常';        mock = { throw 'boom' }; want = $null }
+)
+$a7bad = @()
+foreach ($c in $genCases) {
+  $script:MockEval = $c.mock
+  $got = Test-GenActive 'synthetic-session'
+  $same = if ($null -eq $c.want) { $null -eq $got } else { $null -ne $got -and $got -eq $c.want }
+  if (-not $same) { $a7bad += "$($c.name): 期望 [$($c.want)] 实得 [$($got)]" }
+}
+Add-Result "A7 页面生成信号契约（bool/null 映射）" ($a7bad.Count -eq 0) $(if ($a7bad.Count) { "失败: " + ($a7bad -join '; ') } else { "$($genCases.Count) 组用例全过" })
 
 Write-Host ""
 Write-Host "=== B. 检查器自证（故意注入坑的样本）===" -ForegroundColor Cyan

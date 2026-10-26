@@ -73,7 +73,16 @@ function Get-ConvTurns {
     const r=await fetch('/backend-api/conversation/$ConvId',{headers:h,credentials:'include'});
     if(!r.ok) return JSON.stringify({error:'HTTP '+r.status});
     const j=await r.json();
-    const ms=j.mapping?Object.values(j.mapping).map(n=>n&&n.message).filter(m=>m&&m.author):[];
+    // 只取 current_node 回溯出的活动分支（2026-10-15 修）：mapping 里含"重新生成"留下的
+    // 历史分支，全收会把两版答案都算进同一轮，导致完整档案被误报"截断/片段"。
+    let ms=[];
+    if(j.current_node && j.mapping && j.mapping[j.current_node]){
+      const seen=new Set(); let nid=j.current_node;
+      while(nid && j.mapping[nid] && !seen.has(nid)){ seen.add(nid); ms.push(j.mapping[nid].message); nid=j.mapping[nid].parent; }
+    } else {
+      ms=j.mapping?Object.values(j.mapping).map(n=>n&&n.message):[];
+    }
+    ms=ms.filter(m=>m&&m.author);
     ms.sort((a,b)=>(a.create_time||0)-(b.create_time||0));
     const out=[];
     for(const m of ms){

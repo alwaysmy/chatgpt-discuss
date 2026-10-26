@@ -11,6 +11,8 @@ function Get-ConversationState {
   # 接口有干净的完成信号：end_turn=true && content_type='text' && status='finished_successfully'
   # 2026-10-15：**整轮聚合**——长回答会拆多条消息交付（1~3 条/轮），取"最后一条 user 消息
   # 之后的全部 assistant 文本"拼接；只取最后一条会把文档截段（实测 4250 vs 17778 字）。
+  # 2026-10-15 同时：只取 current_node 回溯出的**活动分支**——mapping 含"重新生成"留下的
+  # 历史分支，全收会把两个版本拼进同一轮。
   param([string]$S, [string]$ConvId)
   $js = @"
 (async()=>{
@@ -20,7 +22,24 @@ function Get-ConversationState {
     const r=await fetch('/backend-api/conversation/$ConvId',{headers:h,credentials:'include'});
     if(!r.ok) return JSON.stringify({error:'HTTP '+r.status});
     const j=await r.json();
-    const all=Object.values(j.mapping||{}).map(n=>n&&n.message).filter(m=>m&&m.author&&m.content);
+    // ── 只取活动分支（2026-10-15 修）────────────────────────────────────────
+    // mapping 是**完整对话树**：用户点"重新生成"后，旧回答仍留在树里（同一 parent 的
+    // 兄弟节点）。以前 Object.values(mapping) 全收，会把两个版本拼进同一轮（合成数据
+    // 实测得到 "OLD-ANSWER\n\nNEW-ANSWER"），档案变成两版拼接且无告警。
+    // 屏幕上可见的多段交付必定都在 current_node 回溯出的活动路径上，所以按 parent 链
+    // 回溯既不会误杀多段，也能排除重新生成留下的历史分支。取不到 current_node 时退回全量。
+    let all=[];
+    if(j.current_node && j.mapping && j.mapping[j.current_node]){
+      const seen=new Set(); const chain=[];
+      let nid=j.current_node;
+      while(nid && j.mapping[nid] && !seen.has(nid)){
+        seen.add(nid); chain.push(j.mapping[nid].message); nid=j.mapping[nid].parent;
+      }
+      all=chain;
+    } else {
+      all=Object.values(j.mapping||{}).map(n=>n&&n.message);
+    }
+    all=all.filter(m=>m&&m.author&&m.content);
     const byTime=all.slice().sort((a,b)=>(a.create_time||0)-(b.create_time||0));
     const isText=m=>m.content.content_type==='text';
     const fin=byTime.filter(m=>m.author.role==='assistant' && m.end_turn===true && isText(m) && m.status==='finished_successfully');
@@ -158,21 +177,30 @@ function Test-AnswerReady {
   # 86+10508+6582）。页面"停止"按钮是廉价的整轮完成信号（一次本机 DOM 读，不耗接口配额）：
   #   GenActive=$false → 生成已结束，落档；
   #   GenActive=$true  → 仍在生成，先不取（继续等整轮）；
-  #   GenActive=$null  → 信号不可用，退化为"两次组合文本逐字一致"才落档。
+  #   GenActive=$null  → 信号不可用，**不能**当完成——继续等，等不到由超时收尾按
+  #                      "不完整"落档并标注（2026-10-15 修正：原先拿"两次组合文本逐字
+  #                      一致"当完成证据是错的，见下）。
   #   accept          —— 可写入档案
   #   wait-generating —— 页面仍在生成（多段交付中间态）
-  #   wait-stability  —— 信号不可用且文本尚未稳定，再读一次
+  #   wait-stability  —— 信号不可用，继续轮询等信号恢复（不是"文本稳定即可落档"）
   #   wait            —— verdict 本身不该取（继续轮询）
+  #
+  # 为什么删掉"两读文本一致就落档"（2026-10-15 修正）：
+  #   `$Text` 只含 end_turn=true 的**已完成段**，后续段流式期间它天然不变。因此
+  #   "两读一致"并不能证明整轮生成结束；只要页面探测出现过一次 $true、紧接着一次瞬态
+  #   异常返回 $null，就可能在段间空档里判定"稳定"并把前缀写进档案——那正是本 PR 要
+  #   修掉的静默截断。信号不可用时唯一安全的做法是继续等（或超时按不完整落档）。
   param(
     [string]$Verdict = '',
-    [object]$GenActive = $null,     # $true / $false / $null
+    [object]$GenActive = $null,     # $true / $false / $null（非 [bool] 一律视为信号不可用）
     [string]$Text = '',
-    [object]$LastText = $null
+    [object]$LastText = $null        # 保留：仅用于调用方诊断，不参与落档判定
   )
   if ($Verdict -ne 'new') { return 'wait' }
-  if ($GenActive -eq $true) { return 'wait-generating' }
-  if ($GenActive -eq $false) { return 'accept' }
-  if ($null -ne $LastText -and $Text -eq [string]$LastText) { return 'accept' }
+  if ($GenActive -is [bool]) {
+    if ($GenActive) { return 'wait-generating' }
+    return 'accept'
+  }
   return 'wait-stability'
 }
 
