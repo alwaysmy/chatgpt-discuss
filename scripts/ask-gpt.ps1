@@ -881,6 +881,8 @@ $apiBackoffMs = 0
 #   ① 会话里出现新的 tool 角色消息（本轮触发了搜索/工具）；
 #   ② 进行中正文连续多轮没有增量。
 $lastPartialLen = -1; $stallCount = 0; $searchSeen = $false
+# 整轮落档门（2026-10-15 加）：多段交付时"先完成的段"不落档，等整轮完成的判据状态。
+$lastTurnText = $null; $genWaitWarned = $false
 # 硬请求预算：无论超时多长，单轮最多读这么多次接口。这是防"把账号打成限流"的兜底，
 # 不指望靠调 -TimeoutSec 去等长回合（那样只会把请求数一起放大）。
 $maxPolls = 40
@@ -946,7 +948,23 @@ while ((Get-Date) -lt $deadline) {
   }
   $verdict = Test-NewAnswer -BaseN $baseN -BaseText $baseText -BaseKnown $baseKnown `
                             -N ([int]$st.n) -Text ([string]$st.text)
-  if ($verdict -eq 'new') { $answer = [string]$st.text; break }
+  # ── 整轮落档门（2026-10-15 加）────────────────────────────────────────────
+  # 多段交付的回答里，先完成的段就会让 Test-NewAnswer 判 new；此时页面可能仍在生成
+  # 后续段，直接落档会丢后半。页面"停止"按钮是廉价的整轮完成信号（一次本机 DOM 读，
+  # 不耗接口配额）：明确结束 → 落档；仍在生成 → 继续等；信号不可用 → 两读一致才落。
+  # 只在"判 new"时才探测页面，其余轮次不必多读 DOM。
+  if ($verdict -eq 'new') {
+    $genActive = Test-GenActive $Session
+    $ready = Test-AnswerReady -Verdict $verdict -GenActive $genActive `
+                              -Text ([string]$st.text) -LastText $lastTurnText
+    if ($ready -eq 'accept') { $answer = [string]$st.text; break }
+    if ($ready -eq 'wait-generating' -and -not $genWaitWarned) {
+      $genWaitWarned = $true
+      Write-Warning ("新完成的段已出现，但页面仍在生成——按多段交付处理，继续等整轮完成" +
+                     "（组合文本当前 $($st.text.Length) 字符）")
+    }
+    $lastTurnText = [string]$st.text
+  }
   if ($verdict -eq 'stale-same-text' -and -not $stallWarned) {
     $stallWarned = $true
     Write-Warning ("读到的最后一条完成回答（n=$($st.n)）与本轮之前的基线正文逐字相同——" +
@@ -973,7 +991,17 @@ if (-not $answer) {
     if ($st -and -not $st.error) {
       $verdict = Test-NewAnswer -BaseN $baseN -BaseText $baseText -BaseKnown $baseKnown `
                                 -N ([int]$st.n) -Text ([string]$st.text)
-      if ($verdict -eq 'new') { $answer = [string]$st.text }
+      if ($verdict -eq 'new') {
+        # 超时收尾也过整轮落档门：页面仍在生成 → 按"不完整"落档并标注（不静默写残缺）
+        if ((Test-GenActive $Session) -eq $true) {
+          $answer = [string]$st.text
+          $answerFromPartial = $true
+          Write-Warning ("超时收尾：新段已出现但页面仍在生成——按**不完整**落档" +
+                         "（组合文本 $($st.text.Length) 字符），请用 tools\verify-docs.ps1 复核")
+        } else {
+          $answer = [string]$st.text
+        }
+      }
       elseif ($verdict -eq 'stale-same-text') {
         Write-Warning "最后一次读取拿到的仍是基线正文（陈旧响应），不作为本轮答案"
       }

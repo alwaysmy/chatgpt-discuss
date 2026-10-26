@@ -46,6 +46,22 @@ function Get-LastAnswerText {
   try { return Eval-JS '(()=>{const els=document.querySelectorAll("[data-message-author-role=\"assistant\"]");const el=els[els.length-1];return el?el.innerText:""})()' $S }
   catch { return $null }
 }
+function Test-GenActive {
+  # 页面是否仍在生成：定位"停止"按钮（生成中才存在）。返回 $true/$false；探测失败返回 $null。
+  # 2026-10-15 加：作为"整轮落档"的页面侧完成信号——多段交付时，先完成的段不落档的判据。
+  # 不押单一选择器：新版无 data-testid 时按 aria-label（停止/stop）兜底，并做可见性检查。
+  param([string]$S)
+  $js = @'
+(()=>{
+  const vis = e => { try { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 } catch(_) { return false } };
+  const a = document.querySelector('button[data-testid="stop-button"]');
+  if (a && vis(a)) return true;
+  const b = [...document.querySelectorAll('button')].find(x => vis(x) && /停止|stop/i.test(x.getAttribute('aria-label') || ''));
+  return !!b;
+})()
+'@
+  try { $v = Eval-JS $js $S; return ("$v" -eq 'true') } catch { return $null }
+}
 function Resolve-ComposerTarget {
   # 定位对话框并打标记 data-cc-composer，返回命中描述（空串 = 没找到）。
   # 不押单一选择器：composer 在登录/未登录、新旧版之间结构不同

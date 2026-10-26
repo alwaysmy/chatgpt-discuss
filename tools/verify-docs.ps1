@@ -11,7 +11,7 @@
     2. 按会话 id 去重（多个文档可能引用同一条会话）
     3. 用 webbridge 在 ChatGPT 页面里 fetch 后端接口，取回该会话的完整 user/assistant 消息
     4. 把文档里的 ## Q<n> 段落按【问题文本前缀】对齐到会话轮次（不按序号，防错位）
-    5. 比对答案：ok / TRUNCATED（文档里的是接口正文的前缀）/ SHORTER / MISMATCH / UNMATCHED
+    5. 比对答案：ok / TRUNCATED（前缀截断）/ 片段（文档是整轮正文的中段/尾段——2026-10-15 起识别）/ SHORTER / MISMATCH / UNMATCHED（接口侧按"该轮全部 assistant 文本聚合"比对）
 .PARAMETER Roots
   要扫描的根目录，默认 D:\MyProjects
 .PARAMETER Only
@@ -188,17 +188,22 @@ foreach ($doc in $withLink) {
       if ($un.Length -ge 20 -and $un.StartsWith($qKey.Substring(0, [Math]::Min(40, $qKey.Length)))) { $turnIdx = $i; break }
     }
     if ($turnIdx -lt 0) { [void]$detail.Add("Q${qIdx}: 会话里找不到对应提问"); $probN++; continue }
-    $apiA = ""
+    # 接口侧按"该轮全部 assistant 文本聚合"比对（2026-10-15：与整轮聚合落档对齐）
+    $apiParts = New-Object System.Collections.Generic.List[string]
     for ($j = $turnIdx + 1; $j -lt $conv.turns.Count; $j++) {
-      if ($conv.turns[$j].r -eq 'a') { $apiA = Normalize-Text $conv.turns[$j].t; break }
+      if ($conv.turns[$j].r -eq 'a') { [void]$apiParts.Add((Normalize-Text $conv.turns[$j].t)); continue }
       if ($conv.turns[$j].r -eq 'u') { break }
     }
+    $apiA = ($apiParts -join "")
     if (-not $apiA) { [void]$detail.Add("Q${qIdx}: 该轮没有已完成回答"); $probN++; continue }
-    # 判据优先级：①完全一致 ②文档是接口的严格前缀＝截断 ③结尾逐字一致＝完整（仅格式差异）
+    # 判据优先级：①完全一致 ②文档是接口的严格前缀＝截断 ③文档是整轮正文的中段/尾段片段 ④结尾逐字一致＝完整（仅格式差异）
     if ($aText -eq $apiA) { $okN++; continue }
     if ($apiA.StartsWith($aText)) {
       $probN++
       [void]$detail.Add("Q${qIdx}: **截断** 文档 " + $aText.Length + " / 接口 " + $apiA.Length + " 字（丢 " + [int](100 - 100.0 * $aText.Length / $apiA.Length) + "%）")
+    } elseif ($apiA.Contains($aText)) {
+      $probN++
+      [void]$detail.Add("Q${qIdx}: **片段** 文档 " + $aText.Length + " / 接口 " + $apiA.Length + " 字（文档是整轮回答的中段/尾段片段，非前缀截断）")
     } elseif ((Get-Tail $aText) -eq (Get-Tail $apiA)) {
       $okN++
       [void]$detail.Add("Q${qIdx}: 完整（结尾逐字一致；仅 markdown 渲染差异，长度 " + $aText.Length + " / " + $apiA.Length + "）")
@@ -212,7 +217,7 @@ foreach ($doc in $withLink) {
   }
   $verdict = if ($probN -eq 0 -and $blocks.Count -gt 0) { "全部一致" } elseif ($blocks.Count -eq 0) { "无可解析段落" } else { "有问题" }
   [void]$verdicts.Add([pscustomobject]@{ 文档 = $doc.Name; 会话 = $doc.ConvId.Substring(0, 8); 段数 = $blocks.Count; 一致 = $okN; 问题 = $probN; 结论 = $verdict })
-  foreach ($d in $detail) { Write-Host ("    " + $doc.Name.PadRight(38) + " " + $d) -ForegroundColor $(if ($d -match '截断') { "Red" } else { "Yellow" }) }
+  foreach ($d in $detail) { Write-Host ("    " + $doc.Name.PadRight(38) + " " + $d) -ForegroundColor $(if ($d -match '截断|片段') { "Red" } else { "Yellow" }) }
 }
 
 Write-Host ""

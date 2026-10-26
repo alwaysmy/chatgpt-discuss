@@ -9,6 +9,8 @@ function Get-ConversationState {
   # 从 ChatGPT 后端接口读权威消息体（而不是抓 DOM）
   # 实测(2026-09-14)：DOM innerText 只拿到第一段（27/163、52/582），丢 80~95% 正文；
   # 接口有干净的完成信号：end_turn=true && content_type='text' && status='finished_successfully'
+  # 2026-10-15：**整轮聚合**——长回答会拆多条消息交付（1~3 条/轮），取"最后一条 user 消息
+  # 之后的全部 assistant 文本"拼接；只取最后一条会把文档截段（实测 4250 vs 17778 字）。
   param([string]$S, [string]$ConvId)
   $js = @"
 (async()=>{
@@ -23,7 +25,19 @@ function Get-ConversationState {
     const isText=m=>m.content.content_type==='text';
     const fin=byTime.filter(m=>m.author.role==='assistant' && m.end_turn===true && isText(m) && m.status==='finished_successfully');
     const last=fin[fin.length-1];
-    const txt=last?(last.content.parts||[]).join(''):'';
+    // ── 整轮聚合（2026-10-15 加）──────────────────────────────────────────────
+    // 网页端会把长回答拆成多条 assistant 消息连续交付（实测 1~3 条/轮）。旧实现只取
+    // fin 最后一条——多段回答时文档只剩最后一段（实测：文档 4250 字 vs 会话 17778 字，
+    // 用户侧表现为"只答了最后一问"）。这里按**最后一条 user 消息之后**聚合本轮全部
+    // 已完成 assistant 文本（时间序，\n\n 分隔）；取不到 user 消息时退回单条。
+    const lastUser=byTime.filter(m=>m.author.role==='user').pop();
+    const lastUserT=(lastUser&&typeof lastUser.create_time==='number')?lastUser.create_time:null;
+    // 已完成段只取本轮（最后一条 user 之后）。注意：本轮还没有完成段时结果应为空，
+    // **不能回退到上一轮的旧答案**（否则部分获取会把旧答案混进本轮正文）；只有整个会话
+    // 都取不到 user 消息时，才退回最后一条完成回答。
+    const turnFin=(lastUserT===null)?(last?[last]:[]):fin.filter(m=>typeof m.create_time==='number'&&m.create_time>lastUserT);
+    const turnParts=(turnFin.length?turnFin:((lastUserT===null&&last)?[last]:[]));
+    const txt=turnParts.map(m=>(m.content.parts||[]).join('')).join('\n\n');
     // 历史生成耗时样本（2026-09-23 加）：用于给轮询节奏与耐心上限提供依据。
     // 实测同一会话内生成耗时可从 4.5s 到 274s（方差极大），所以它**不能用来预测**
     // 本轮要多久，只能用来判断"已经等得比历史最久还长了"这类异常。
@@ -35,12 +49,17 @@ function Get-ConversationState {
     // 用于"先部分获取"：不等它收尾，把当前已生成的部分取回来（调用方必须标注为不完整）。
     const asstText=byTime.filter(m=>m.author.role==='assistant' && isText(m));
     const newest=asstText[asstText.length-1];
-    const partialText=(newest && newest.end_turn!==true) ? ((newest.content.parts||[]).join('')) : '';
+    // 部分获取同样按"整轮"：本轮已完成段 + 进行中段（否则多段交付时光取后半/前半）。
+    let partialText='';
+    if (newest && newest.end_turn!==true && (lastUserT===null || (typeof newest.create_time==='number' && newest.create_time>lastUserT))) {
+      const inprog=(newest.content.parts||[]).join('');
+      partialText=(txt.length>0)?(txt+'\n\n'+inprog):inprog;
+    }
     // ── 工具/搜索活动（2026-09-23 加）───────────────────────────────────────
     // ChatGPT 联网搜索期间会先插 tool 角色的消息，这段时间答案根本不会增长；
     // 此处把"本轮是否出现工具活动"报给调用方，让它**别在搜索期间一直轮询**。
     const toolMsgs=byTime.filter(m=>m.author.role==='tool');
-    return JSON.stringify({n:fin.length,len:txt.length,text:txt,gen_seconds:gen,
+    return JSON.stringify({n:fin.length,turn_parts:turnParts.length,len:txt.length,text:txt,gen_seconds:gen,
                            partial_len:partialText.length,partial_text:partialText,
                            tool_count:toolMsgs.length});
   }catch(e){ return JSON.stringify({error:String(e)}) }
@@ -130,6 +149,31 @@ function Test-PartialAnswer {
   if (-not $PartialText -or $PartialText.Length -eq 0) { return 'not-ready' }
   if ($BaseText -and $PartialText -eq $BaseText) { return 'not-ready' }
   return 'partial'
+}
+
+function Test-AnswerReady {
+  # 整轮落档门（纯函数，表驱动，2026-10-15 加）：Test-NewAnswer 判 new 之后，现在能不能
+  # 真的把这段正文写进档案。多段交付的回答里，**先完成的段**就会让 Test-NewAnswer 判 new，
+  # 但页面可能仍在生成后续段——直接落档会丢后半（实测案例：5262+3967、13090+4837、
+  # 86+10508+6582）。页面"停止"按钮是廉价的整轮完成信号（一次本机 DOM 读，不耗接口配额）：
+  #   GenActive=$false → 生成已结束，落档；
+  #   GenActive=$true  → 仍在生成，先不取（继续等整轮）；
+  #   GenActive=$null  → 信号不可用，退化为"两次组合文本逐字一致"才落档。
+  #   accept          —— 可写入档案
+  #   wait-generating —— 页面仍在生成（多段交付中间态）
+  #   wait-stability  —— 信号不可用且文本尚未稳定，再读一次
+  #   wait            —— verdict 本身不该取（继续轮询）
+  param(
+    [string]$Verdict = '',
+    [object]$GenActive = $null,     # $true / $false / $null
+    [string]$Text = '',
+    [object]$LastText = $null
+  )
+  if ($Verdict -ne 'new') { return 'wait' }
+  if ($GenActive -eq $true) { return 'wait-generating' }
+  if ($GenActive -eq $false) { return 'accept' }
+  if ($null -ne $LastText -and $Text -eq [string]$LastText) { return 'accept' }
+  return 'wait-stability'
 }
 
 function Get-ChatListJs {
