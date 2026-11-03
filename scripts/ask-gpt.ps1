@@ -938,8 +938,8 @@ while ((Get-Date) -lt $deadline) {
   if (-not $searchSeen -and $st.PSObject.Properties['tool_count'] -and
       [int]$st.tool_count -gt $baseToolCount) {
     $searchSeen = $true
-    Write-Warning "本轮出现工具/搜索活动（tool 消息 $baseToolCount → $($st.tool_count)）——" +
-                  "搜索期间答案不会增长，已把轮询放慢到 ≥30s，不再密集读接口"
+    Write-Warning ("本轮出现工具/搜索活动（tool 消息 $baseToolCount → $($st.tool_count)）——" +
+                   "搜索期间答案不会增长，已把轮询放慢到 ≥30s，不再密集读接口")
   }
   if ($st.PSObject.Properties['partial_len']) {
     $plen = [int]$st.partial_len
